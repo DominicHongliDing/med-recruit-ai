@@ -9,7 +9,6 @@ from email.mime.multipart import MIMEMultipart
 
 # --- Configuration ---
 def configure_ai(api_key: str):
-    # Cloud Deployment: No Proxy needed
     if api_key:
         genai.configure(api_key=api_key)
 
@@ -30,68 +29,99 @@ def extract_text_from_file(uploaded_file) -> str:
     except Exception as e:
         return f"Error reading file: {str(e)}"
 
-# --- ANALYSIS LOGIC ---
+# --- MULTI-AGENT WORKFLOW ---
 def analyze_batch_candidate(resume_text: str, jd_text: str, must_haves: str, role_type: str) -> dict:
     
-    model = genai.GenerativeModel('gemini-2.0-flash', generation_config={"response_mime_type": "application/json"})
+    # We use Flash because it is fast enough to run 3 times in a row quickly
+    model = genai.GenerativeModel('gemini-2.0-flash')
+
+    # --- AGENT 1: THE FACT EXTRACTOR (No Judgment, Just Data) ---
+    # Purpose: Prevent hallucination by forcing raw data extraction first.
+    prompt_agent_1 = f"""
+    ROLE: Data Extraction Specialist.
+    TASK: Extract hard data from the CV. Do not evaluate quality yet.
+    CV TEXT: {resume_text[:15000]}
     
-    # 1. PI / Postdoc Prompt
+    EXTRACT:
+    1. Name & Email
+    2. Total Years of Experience (Number)
+    3. H-Index / Citations (If research role)
+    4. Top 3 Papers (Title + Journal)
+    5. List of Hard Skills
+    
+    OUTPUT: JSON only.
+    """
+    try:
+        raw_data_response = model.generate_content(prompt_agent_1, generation_config={"response_mime_type": "application/json"})
+        extracted_facts = json.loads(raw_data_response.text)
+    except:
+        extracted_facts = {}
+
+    # --- AGENT 2: THE CRITIC (The "Bad Cop") ---
+    # Purpose: AI is usually too nice. This agent is forced to find flaws.
+    prompt_agent_2 = f"""
+    ROLE: Senior Risk Analyst / "Devil's Advocate".
+    TASK: Review the Candidate Data against the JD and find 3 specific RISKS or GAPS.
+    
+    JD: {jd_text}
+    MUST HAVES: {must_haves}
+    CANDIDATE FACTS: {json.dumps(extracted_facts)}
+    
+    INSTRUCTIONS:
+    - Be strict.
+    - Look for: Short tenures, low journal impact, missing specific tech stack, generic descriptions.
+    - If they miss a "Must Have", flag it immediately.
+    
+    OUTPUT: List of 3 brief bullet points explaining the risks.
+    """
+    try:
+        critique_response = model.generate_content(prompt_agent_2)
+        critique_text = critique_response.text
+    except:
+        critique_text = "Analysis failed."
+
+    # --- AGENT 3: THE HIRING MANAGER (Final Decision) ---
+    # Purpose: Synthesize Facts + Critique + JD into a final Score.
+    
+    # Dynamic JSON structure based on role (Same as before, but smarter now)
     if "PI" in role_type or "Postdoc" in role_type:
-        task_prompt = """
-        TASK: Deep Academic Profiling.
-        1. Metrics: Extract H-Index (Est if needed) and Total Citations.
-        2. Papers: Identify top 3 high-impact papers.
-        3. Grants: Look for NSFC/NIH funding.
-        """
         json_structure = """
         "bibliometrics": {"h_index": "Val", "total_citations": "Val", "total_paper_count": "Val"},
         "representative_papers": [{"title": "", "journal": "", "role": "", "significance": ""}],
         "grants_found": ["Grant 1"],
         """
-
-    # 2. Research Assistant Prompt
     elif "Research Assistant" in role_type:
-        task_prompt = """
-        TASK: Technical Skill & Execution Profiling.
-        1. Lab Skills: Extract specific wet/dry lab techniques (e.g. PCR, Cell Culture, Python).
-        2. Experience: Look for project participation and reliability.
-        3. Publications: Count papers (participation is good, but first author not required).
-        """
         json_structure = """
         "technical_skills": ["Skill 1", "Skill 2"],
         "lab_experience_years": "Value",
         "project_participation": ["Project 1", "Project 2"],
         """
-
-    # 3. Admin / Support Prompt
     else: 
-        task_prompt = """
-        TASK: Administrative & Soft Skill Profiling.
-        1. Skills: Project Management, Communication, Office/SAP software, Event Planning.
-        2. Experience: Years of relevant work, previous hospital/uni experience.
-        3. Tone: Professionalism and organizational ability.
-        """
         json_structure = """
         "core_competencies": ["Competency 1", "Competency 2"],
         "years_experience": "Value",
         "software_tools": ["Tool 1", "Tool 2"],
         """
 
-    prompt = f"""
-    You are an Expert Hospital Recruiter evaluating candidates for a: {role_type} role.
+    prompt_agent_3 = f"""
+    ROLE: Final Hiring Decision Maker.
     
-    TARGET REQUIREMENTS: {jd_text}
-    CRITERIA: {must_haves}
-    CANDIDATE CV: {resume_text}
+    INPUTS:
+    1. JD: {jd_text}
+    2. CANDIDATE FACTS: {json.dumps(extracted_facts)}
+    3. RISK REPORT (From Risk Analyst): {critique_text}
     
-    {task_prompt}
+    TASK: Generate the Final Evaluation JSON.
+    - Use the Risk Report to lower the score if necessary.
+    - Be objective.
     
     OUTPUT SCHEMA (JSON):
     {{
-        "name": "Name",
-        "email": "Email",
-        "fit_score": 0-100 (Relevance to this specific role type),
-        "summary": "Executive summary",
+        "name": "{extracted_facts.get('name', 'Candidate')}",
+        "email": "{extracted_facts.get('email', '')}",
+        "fit_score": 0-100,
+        "summary": "Executive summary incorporating strengths and the risks identified.",
+        "critique_notes": "{critique_text.replace(chr(10), ' | ')}", 
         {json_structure}
         "strengths": ["Strength 1", "Strength 2"],
         "gaps": ["Gap 1"]
@@ -99,77 +129,43 @@ def analyze_batch_candidate(resume_text: str, jd_text: str, must_haves: str, rol
     """
     
     try:
-        response = model.generate_content(prompt)
-        data = json.loads(response.text)
+        final_response = model.generate_content(prompt_agent_3, generation_config={"response_mime_type": "application/json"})
+        data = json.loads(final_response.text)
         if isinstance(data, list): return data[0]
         return data
     except Exception as e:
         return {"name": "Error", "fit_score": 0, "summary": f"AI Error: {str(e)}"}
 
-# --- AGENTIC EMAIL GENERATOR (Draft -> Critic -> Refine) ---
+# --- EMAIL AGENT (Refiner Loop) ---
 def generate_recruitment_email(candidate_data: dict, sender_info: dict, role_type: str) -> str:
-    """
-    Uses a 2-step process: Draft, then Polish to remove hallucinations/scores.
-    """
     model = genai.GenerativeModel('gemini-2.0-flash')
     
-    # --- Step 1: Prepare Hook Data ---
-    hook_text = ""
-    papers = candidate_data.get('representative_papers', [])
-    if papers and len(papers) > 0:
-        top_paper = papers[0].get('title', 'recent publication')
-        hook_text = f"I was particularly impressed by your work on '{top_paper}'."
-    elif candidate_data.get('technical_skills'):
-        skills = ", ".join(candidate_data.get('technical_skills')[:2])
-        hook_text = f"Your proficiency in {skills} caught our eye."
-    
-    focus_area = candidate_data.get('research_focus_area', 'your professional background')
-
-    # --- Step 2: First Draft ---
+    # 1. Draft
     draft_prompt = f"""
-    You are {sender_info['name']}, the {sender_info['title']} at {sender_info['org']}.
-    Write a recruiting email to {candidate_data.get('name')} for a {role_type} role.
-    
-    Context:
-    - Hook: {hook_text}
-    - Field: {focus_area}
-    - Tone: Professional & Personalized.
-    
-    Output: Email Body Only.
+    Writer: {sender_info['name']} ({sender_info['org']}).
+    Target: {candidate_data.get('name')}. Role: {role_type}.
+    Focus: {candidate_data.get('research_focus_area', 'Background')}.
+    Tone: Professional.
+    Write a recruitment email asking for a 15-min call.
     """
-    try:
-        draft = model.generate_content(draft_prompt).text
-    except:
-        return "Error generating draft."
+    draft = model.generate_content(draft_prompt).text
 
-    # --- Step 3: THE REFINER AGENT (Self-Correction) ---
-    # This agent acts as a strict editor to fix the bugs you saw.
+    # 2. Refine (Self-Correction Agent)
     refiner_prompt = f"""
-    You are a strict Editor. Review and Rewrite the following email draft.
-    
-    DRAFT:
-    {draft}
-    
-    YOUR TASK:
-    1. **REMOVE SCORES**: If the text says "Score of 75" or "Fit Score", DELETE IT completely. Replace with "Given your strong background..."
-    2. **REMOVE PLACEHOLDERS**: If you see brackets like [Insert Lab Name] or [Specific Project], REMOVE THEM. 
-       - Instead, use generic phrases like "our research department" or "ongoing clinical studies".
-       - NEVER leave a bracket [] in the final text.
-    3. **Ensure Polish**: Keep the specific mention of their skills/papers, but make the rest smooth.
-    
-    Output: The clean, final email text only.
+    Review this email draft.
+    DRAFT: {draft}
+    RULES: 
+    1. Remove any brackets [].
+    2. Remove internal scores (e.g. "Score: 80").
+    3. Ensure sender is {sender_info['name']}.
+    Output: Clean email text only.
     """
-    
-    try:
-        final_email = model.generate_content(refiner_prompt).text
-        return final_email
-    except:
-        return draft # Fallback to draft if refiner fails
+    return model.generate_content(refiner_prompt).text
 
 # --- REAL EMAIL SENDER ---
 def send_real_email(sender_email, sender_password, recipient_email, subject, body):
     try:
-        # Standard SMTP for Cloud Deployment
+        # Standard SMTP
         message = MIMEMultipart()
         message['From'] = sender_email
         message['To'] = recipient_email
