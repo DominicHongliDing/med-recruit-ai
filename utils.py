@@ -106,61 +106,65 @@ def analyze_batch_candidate(resume_text: str, jd_text: str, must_haves: str, rol
     except Exception as e:
         return {"name": "Error", "fit_score": 0, "summary": f"AI Error: {str(e)}"}
 
-# --- SMART EMAIL GENERATOR (Fixed: No Placeholders) ---
+# --- AGENTIC EMAIL GENERATOR (Draft -> Critic -> Refine) ---
 def generate_recruitment_email(candidate_data: dict, sender_info: dict, role_type: str) -> str:
     """
-    Generates a highly personalized email.
+    Uses a 2-step process: Draft, then Polish to remove hallucinations/scores.
     """
     model = genai.GenerativeModel('gemini-2.0-flash')
     
-    # --- 1. Prepare Hook Data ---
+    # --- Step 1: Prepare Hook Data ---
     hook_text = ""
-    
-    # Hook for PI/Researchers (Papers)
     papers = candidate_data.get('representative_papers', [])
     if papers and len(papers) > 0:
         top_paper = papers[0].get('title', 'recent publication')
         hook_text = f"I was particularly impressed by your work on '{top_paper}'."
-        
-    # Hook for RA/Admin (Skills)
     elif candidate_data.get('technical_skills'):
         skills = ", ".join(candidate_data.get('technical_skills')[:2])
-        hook_text = f"Your technical proficiency in {skills} caught our eye and aligns well with our lab's needs."
+        hook_text = f"Your proficiency in {skills} caught our eye."
     
-    # Fallback Focus Area
     focus_area = candidate_data.get('research_focus_area', 'your professional background')
 
-    # --- 2. Stricter Prompt ---
-    prompt = f"""
+    # --- Step 2: First Draft ---
+    draft_prompt = f"""
     You are {sender_info['name']}, the {sender_info['title']} at {sender_info['org']}.
+    Write a recruiting email to {candidate_data.get('name')} for a {role_type} role.
     
-    Write a professional recruiting email to:
-    Name: {candidate_data.get('name')}
-    Role: {role_type}
+    Context:
+    - Hook: {hook_text}
+    - Field: {focus_area}
+    - Tone: Professional & Personalized.
     
-    CONTEXT:
-    - Candidate Strength: {hook_text} (Mention this early!)
-    - Their Focus: {focus_area}
-    - Internal Fit Score: {candidate_data.get('fit_score')} (High = >80, Med = 50-80, Low = <50)
+    Output: Email Body Only.
+    """
+    try:
+        draft = model.generate_content(draft_prompt).text
+    except:
+        return "Error generating draft."
+
+    # --- Step 3: THE REFINER AGENT (Self-Correction) ---
+    # This agent acts as a strict editor to fix the bugs you saw.
+    refiner_prompt = f"""
+    You are a strict Editor. Review and Rewrite the following email draft.
     
-    CRITICAL RULES:
-    1. **NO PLACEHOLDERS**: NEVER leave brackets like [Insert Project] or [Date].
-    2. **NO INTERNAL DATA**: Do NOT mention the "Score" (e.g. "Score of 70") to the candidate. That is rude.
-    3. **BE GENERAL IF NEEDED**: If you don't know the specific lab name, use "our research team" or "our department".
-    4. **CALL TO ACTION**: Ask "Are you available for a brief 15-minute introductory call next week?"
+    DRAFT:
+    {draft}
     
-    TONE GUIDE:
-    - If Score > 80: Enthusiastic. "Your background is exactly what we are looking for."
-    - If Score < 80: Polite but interested. "We see potential in your profile."
+    YOUR TASK:
+    1. **REMOVE SCORES**: If the text says "Score of 75" or "Fit Score", DELETE IT completely. Replace with "Given your strong background..."
+    2. **REMOVE PLACEHOLDERS**: If you see brackets like [Insert Lab Name] or [Specific Project], REMOVE THEM. 
+       - Instead, use generic phrases like "our research department" or "ongoing clinical studies".
+       - NEVER leave a bracket [] in the final text.
+    3. **Ensure Polish**: Keep the specific mention of their skills/papers, but make the rest smooth.
     
-    OUTPUT: Email Body Only. No Subject Line.
+    Output: The clean, final email text only.
     """
     
     try:
-        response = model.generate_content(prompt)
-        return response.text
+        final_email = model.generate_content(refiner_prompt).text
+        return final_email
     except:
-        return "Error generating smart email."
+        return draft # Fallback to draft if refiner fails
 
 # --- REAL EMAIL SENDER ---
 def send_real_email(sender_email, sender_password, recipient_email, subject, body):
@@ -180,3 +184,4 @@ def send_real_email(sender_email, sender_password, recipient_email, subject, bod
         return True, "Email Sent Successfully"
     except Exception as e:
         return False, f"Failed: {str(e)}"
+
