@@ -7,12 +7,9 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
-# --- Configuration ---
 def configure_ai(api_key: str):
-    if api_key:
-        genai.configure(api_key=api_key)
+    if api_key: genai.configure(api_key=api_key)
 
-# --- Parsing ---
 def extract_text_from_file(uploaded_file) -> str:
     try:
         if uploaded_file.name.endswith('.pdf'):
@@ -29,25 +26,31 @@ def extract_text_from_file(uploaded_file) -> str:
     except Exception as e:
         return f"Error reading file: {str(e)}"
 
-# --- MULTI-AGENT WORKFLOW ---
+# --- IMPROVED MULTI-AGENT WORKFLOW ---
 def analyze_batch_candidate(resume_text: str, jd_text: str, must_haves: str, role_type: str) -> dict:
     
-    # We use Flash because it is fast enough to run 3 times in a row quickly
     model = genai.GenerativeModel('gemini-2.0-flash')
 
-    # --- AGENT 1: THE FACT EXTRACTOR (No Judgment, Just Data) ---
-    # Purpose: Prevent hallucination by forcing raw data extraction first.
+    # --- AGENT 1: THE TRANSLATOR & EXTRACTOR ---
+    # Fixes the "Cornell vs 康乃尔" issue by forcing English normalization
     prompt_agent_1 = f"""
-    ROLE: Data Extraction Specialist.
-    TASK: Extract hard data from the CV. Do not evaluate quality yet.
+    ROLE: Data Extraction & Normalization Specialist.
+    
+    TASK: Extract data from the CV.
+    CRITICAL RULE: **CROSS-LANGUAGE NORMALIZATION**.
+    - If the CV is in Chinese, extract the original text BUT also provide the English translation in brackets.
+    - Example: "毕业于康乃尔大学" -> "University: Kangnaier (Cornell University)"
+    - Example: "擅长生物建模" -> "Skills: Biological Modeling"
+    
     CV TEXT: {resume_text[:15000]}
     
-    EXTRACT:
-    1. Name & Email
-    2. Total Years of Experience (Number)
-    3. H-Index / Citations (If research role)
-    4. Top 3 Papers (Title + Journal)
-    5. List of Hard Skills
+    EXTRACT JSON:
+    1. Name (English & Chinese if avail)
+    2. Email
+    3. Education (University Name + Degree). *Remember to normalize to English*
+    4. Total Years of Experience (Number)
+    5. List of Hard Skills (Translated to English)
+    6. Top 3 Papers (If applicable)
     
     OUTPUT: JSON only.
     """
@@ -57,22 +60,20 @@ def analyze_batch_candidate(resume_text: str, jd_text: str, must_haves: str, rol
     except:
         extracted_facts = {}
 
-    # --- AGENT 2: THE CRITIC (The "Bad Cop") ---
-    # Purpose: AI is usually too nice. This agent is forced to find flaws.
+    # --- AGENT 2: THE CRITIC (Context Aware) ---
     prompt_agent_2 = f"""
-    ROLE: Senior Risk Analyst / "Devil's Advocate".
-    TASK: Review the Candidate Data against the JD and find 3 specific RISKS or GAPS.
+    ROLE: Senior Risk Analyst.
+    TASK: Review Candidate against JD.
     
     JD: {jd_text}
     MUST HAVES: {must_haves}
-    CANDIDATE FACTS: {json.dumps(extracted_facts)}
+    CANDIDATE FACTS (Normalized): {json.dumps(extracted_facts)}
     
     INSTRUCTIONS:
-    - Be strict.
-    - Look for: Short tenures, low journal impact, missing specific tech stack, generic descriptions.
-    - If they miss a "Must Have", flag it immediately.
+    - Compare the English Normalized terms. (e.g. If JD asks for "Cornell", and Facts say "Kangnaier (Cornell)", that is a MATCH. Do not flag it).
+    - Be strict on years of experience and specific technical skills.
     
-    OUTPUT: List of 3 brief bullet points explaining the risks.
+    OUTPUT: List of 3 brief bullet points explaining risks. If no major risks, write "No major red flags detected."
     """
     try:
         critique_response = model.generate_content(prompt_agent_2)
@@ -80,50 +81,35 @@ def analyze_batch_candidate(resume_text: str, jd_text: str, must_haves: str, rol
     except:
         critique_text = "Analysis failed."
 
-    # --- AGENT 3: THE HIRING MANAGER (Final Decision) ---
-    # Purpose: Synthesize Facts + Critique + JD into a final Score.
-    
-    # Dynamic JSON structure based on role (Same as before, but smarter now)
+    # --- AGENT 3: THE DECISION MAKER ---
+    # (JSON Structure setup)
     if "PI" in role_type or "Postdoc" in role_type:
-        json_structure = """
-        "bibliometrics": {"h_index": "Val", "total_citations": "Val", "total_paper_count": "Val"},
-        "representative_papers": [{"title": "", "journal": "", "role": "", "significance": ""}],
-        "grants_found": ["Grant 1"],
-        """
+        json_struct = '"bibliometrics": {"h_index": "Val", "total_citations": "Val"}, "representative_papers": [{"title":"", "journal":"", "significance":""}],'
     elif "Research Assistant" in role_type:
-        json_structure = """
-        "technical_skills": ["Skill 1", "Skill 2"],
-        "lab_experience_years": "Value",
-        "project_participation": ["Project 1", "Project 2"],
-        """
+        json_struct = '"technical_skills": ["Skill 1"], "lab_experience_years": "Val", "project_participation": ["Proj 1"],'
     else: 
-        json_structure = """
-        "core_competencies": ["Competency 1", "Competency 2"],
-        "years_experience": "Value",
-        "software_tools": ["Tool 1", "Tool 2"],
-        """
+        json_struct = '"core_competencies": ["Comp 1"], "software_tools": ["Tool 1"],'
 
     prompt_agent_3 = f"""
     ROLE: Final Hiring Decision Maker.
-    
     INPUTS:
     1. JD: {jd_text}
-    2. CANDIDATE FACTS: {json.dumps(extracted_facts)}
-    3. RISK REPORT (From Risk Analyst): {critique_text}
+    2. FACTS: {json.dumps(extracted_facts)}
+    3. RISKS: {critique_text}
     
-    TASK: Generate the Final Evaluation JSON.
-    - Use the Risk Report to lower the score if necessary.
-    - Be objective.
+    TASK: Final Evaluation JSON.
+    - If the Risk Analyst flagged a language confusion (e.g. Cornell vs 康乃尔), ignore the risk if the facts prove it's the same school.
+    - Score heavily on the match of specific research areas.
     
     OUTPUT SCHEMA (JSON):
     {{
         "name": "{extracted_facts.get('name', 'Candidate')}",
         "email": "{extracted_facts.get('email', '')}",
         "fit_score": 0-100,
-        "summary": "Executive summary incorporating strengths and the risks identified.",
-        "critique_notes": "{critique_text.replace(chr(10), ' | ')}", 
-        {json_structure}
-        "strengths": ["Strength 1", "Strength 2"],
+        "summary": "Executive summary.",
+        "critique_notes": "{critique_text.replace(chr(10), ' ')}", 
+        {json_struct}
+        "strengths": ["Strength 1"],
         "gaps": ["Gap 1"]
     }}
     """
@@ -136,11 +122,11 @@ def analyze_batch_candidate(resume_text: str, jd_text: str, must_haves: str, rol
     except Exception as e:
         return {"name": "Error", "fit_score": 0, "summary": f"AI Error: {str(e)}"}
 
-# --- EMAIL AGENT (Refiner Loop) ---
+# --- EMAIL AGENT ---
 def generate_recruitment_email(candidate_data: dict, sender_info: dict, role_type: str) -> str:
     model = genai.GenerativeModel('gemini-2.0-flash')
     
-    # 1. Draft
+    # Draft
     draft_prompt = f"""
     Writer: {sender_info['name']} ({sender_info['org']}).
     Target: {candidate_data.get('name')}. Role: {role_type}.
@@ -150,28 +136,25 @@ def generate_recruitment_email(candidate_data: dict, sender_info: dict, role_typ
     """
     draft = model.generate_content(draft_prompt).text
 
-    # 2. Refine (Self-Correction Agent)
+    # Refine
     refiner_prompt = f"""
     Review this email draft.
     DRAFT: {draft}
     RULES: 
     1. Remove any brackets [].
-    2. Remove internal scores (e.g. "Score: 80").
-    3. Ensure sender is {sender_info['name']}.
-    Output: Clean email text only.
+    2. Remove internal scores.
+    3. Output: Clean email text only.
     """
     return model.generate_content(refiner_prompt).text
 
-# --- REAL EMAIL SENDER ---
 def send_real_email(sender_email, sender_password, recipient_email, subject, body):
     try:
-        # Standard SMTP
+        # SMTP Standard
         message = MIMEMultipart()
         message['From'] = sender_email
         message['To'] = recipient_email
         message['Subject'] = subject
         message.attach(MIMEText(body, 'plain'))
-        
         session = smtplib.SMTP('smtp.gmail.com', 587) 
         session.starttls()
         session.login(sender_email, sender_password) 
