@@ -1,12 +1,16 @@
 import streamlit as st
 import pandas as pd
 from utils import configure_ai, extract_text_from_file, analyze_batch_candidate, generate_recruitment_email, send_real_email
+# 引入新写的存储管理器
+from preset_manager import load_presets, save_preset, delete_preset
 
 # --- 页面配置 ---
 st.set_page_config(page_title="医学人才智能招聘系统", page_icon="🏥", layout="wide")
 
+# --- Session State 初始化 ---
 if "batch_data" not in st.session_state: st.session_state["batch_data"] = [] 
 if "jd_text" not in st.session_state: st.session_state["jd_text"] = ""
+if "must_haves" not in st.session_state: st.session_state["must_haves"] = ""
 if "role_type" not in st.session_state: st.session_state["role_type"] = "🧪 PI / 博士后 (Postdoc)"
 
 # --- CSS 样式 ---
@@ -27,10 +31,34 @@ st.markdown("""
 with st.sidebar:
     st.markdown("### 🏥 浙大医学中心招聘系统", unsafe_allow_html=True)
     page = st.radio("功能导航", ["📊 人才评估仪表盘", "📧 智能邀约助手"], index=0)
+    
     st.divider()
+    
+    # --- 🌟 新增功能：岗位记忆库 ---
+    st.markdown("#### 📁 岗位记忆库")
+    presets = load_presets()
+    preset_names = ["-- 新建/未选择 --"] + list(presets.keys())
+    
+    selected_preset = st.selectbox("选择已保存的岗位模板", preset_names)
+    
+    # 如果选择了某个模板，自动填充数据
+    if selected_preset != "-- 新建/未选择 --":
+        data = presets[selected_preset]
+        # 将数据载入 Session State
+        st.session_state["jd_text"] = data["jd"]
+        st.session_state["must_haves"] = data["must_haves"]
+        st.session_state["role_type"] = data["role_type"]
+        # st.success(f"已加载: {selected_preset}") 
+        
+        if st.button("🗑️ 删除此模板"):
+            delete_preset(selected_preset)
+            st.rerun()
+            
+    st.divider()
+    
     api_key = st.text_input("Google API Key", type="password")
     if api_key: configure_ai(api_key)
-    st.success(f"当前已加载 {len(st.session_state['batch_data'])} 位候选人")
+    st.success(f"当前候选人: {len(st.session_state['batch_data'])}")
 
 # =========================================================
 # 视图 1: 评估仪表盘
@@ -42,20 +70,31 @@ if page == "📊 人才评估仪表盘":
     with st.container():
         st.subheader("⚙️ 招聘岗位配置")
         
-        # 记录之前的选择，用于清空数据
-        prev_role = st.session_state.get("role_type")
-        st.session_state["role_type"] = st.radio("选择招聘赛道:", ["🧪 PI / 博士后 (Postdoc)", "🧬 科研助理 (RA)", "💼 行政管理 (Admin)"], horizontal=True)
-        
-        if prev_role != st.session_state["role_type"] and len(st.session_state["batch_data"]) > 0:
-            st.warning("⚠️ 切换赛道将清空当前数据")
-            if st.button("确认切换并清空"):
-                st.session_state["batch_data"] = []
-                st.rerun()
+        # 赛道选择
+        st.session_state["role_type"] = st.radio(
+            "选择招聘赛道:", 
+            ["🧪 PI / 博士后 (Postdoc)", "🧬 科研助理 (RA)", "💼 行政管理 (Admin)"], 
+            horizontal=True,
+            index=["🧪 PI / 博士后 (Postdoc)", "🧬 科研助理 (RA)", "💼 行政管理 (Admin)"].index(st.session_state["role_type"]) if st.session_state["role_type"] in ["🧪 PI / 博士后 (Postdoc)", "🧬 科研助理 (RA)", "💼 行政管理 (Admin)"] else 0
+        )
 
         c1, c2 = st.columns([1, 1])
         with c1:
-            st.session_state["jd_text"] = st.text_area("职位描述 (JD)", value=st.session_state["jd_text"], height=100, placeholder="请粘贴职位描述...")
-            must_haves = st.text_input("核心硬性要求 (Must Haves)", placeholder="例如：海外博士, Nature一作, 3年以上经验")
+            # 这里的 value 绑定了 session_state，所以切换模板会自动变
+            st.session_state["jd_text"] = st.text_area("职位描述 (JD)", value=st.session_state["jd_text"], height=150, placeholder="粘贴JD...")
+            st.session_state["must_haves"] = st.text_input("核心硬性要求 (Must Haves)", value=st.session_state.get("must_haves", ""), placeholder="例如：海外博士, Nature一作")
+            
+            # --- 保存模板区域 ---
+            with st.expander("💾 将当前要求保存为新模板"):
+                new_preset_name = st.text_input("模板名称 (例如: 2025行政岗)")
+                if st.button("保存模板"):
+                    if new_preset_name and st.session_state["jd_text"]:
+                        save_preset(new_preset_name, st.session_state["jd_text"], st.session_state["must_haves"], st.session_state["role_type"])
+                        st.success(f"模板【{new_preset_name}】已保存！")
+                        st.rerun()
+                    else:
+                        st.error("请输入名称和JD内容")
+
         with c2:
             st.write("批量上传简历")
             files = st.file_uploader("支持 PDF / Word", accept_multiple_files=True, label_visibility="collapsed")
@@ -64,8 +103,9 @@ if page == "📊 人才评估仪表盘":
                     st.session_state["batch_data"] = []
                     bar = st.progress(0)
                     for i, f in enumerate(files):
-                        with st.spinner(f"正在分析 {f.name} (Agent 1 提取 -> Agent 2 风控 -> Agent 3 评分)..."):
-                            res = analyze_batch_candidate(extract_text_from_file(f), st.session_state["jd_text"], must_haves, st.session_state["role_type"])
+                        with st.spinner(f"正在分析 {f.name}..."):
+                            # 注意：这里传入的是 st.session_state 里的值
+                            res = analyze_batch_candidate(extract_text_from_file(f), st.session_state["jd_text"], st.session_state["must_haves"], st.session_state["role_type"])
                             res['file_name'] = f.name
                             res['role_type'] = st.session_state["role_type"]
                             st.session_state["batch_data"].append(res)
